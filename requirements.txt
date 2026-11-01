@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+python-multipart
+pydantic
+requests
+httpx
+beautifulsoup4
+numpy
+Pillow
+scipy
+python-dotenv
+opencv-python-headless
+pypdf
