@@ -1,0 +1,498 @@
+import json
+import logging
+import math
+from pathlib import Path
+from typing import Optional, Tuple, Dict, Any, List
+
+from backend.models.safety import (
+    CrimeCategoryStat,
+    DistrictCrimeProfile,
+    PoliceStationFacility,
+    LocalitySafetyResponse,
+    OfficialStateCrimeStat,
+    NationalSafetyOverviewResponse,
+)
+from backend.services.location import fetch_overpass_infrastructure
+
+logger = logging.getLogger("nivas.services.crime_data")
+
+
+def calculate_haversine_distance_km(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> Optional[float]:
+    """Calculate great-circle distance between two coordinates in kilometers."""
+    try:
+        if any(x is None or math.isnan(x) for x in (lat1, lon1, lat2, lon2)):
+            return None
+        r = 6371.0
+        d_lat = math.radians(lat2 - lat1)
+        d_lon = math.radians(lon2 - lon1)
+        a = (
+            math.sin(d_lat / 2.0) ** 2
+            + math.cos(math.radians(lat1))
+            * math.cos(math.radians(lat2))
+            * math.sin(d_lon / 2.0) ** 2
+        )
+        c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(1.0 - a))
+        return round(r * c, 2)
+    except Exception:
+        return None
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+CRIME_DATA_PATH = BASE_DIR / "data" / "crime" / "delhi_district_crime_baseline.json"
+DISTRICTS_GEOJSON_PATH = BASE_DIR / "data" / "crime" / "delhi_police_districts.geojson"
+POLICE_STATIONS_PATH = BASE_DIR / "data" / "crime" / "delhi_police_stations_reference.json"
+INDIA_STATES_GEOJSON_PATH = BASE_DIR / "data" / "crime" / "india_states_safety.geojson"
+INDIA_STATES_TABLE1A_PATH = BASE_DIR / "data" / "crime" / "india_states_crime_table1a.json"
+
+# Module-level cache
+_CACHED_BASELINE: Optional[Dict[str, Any]] = None
+_CACHED_GEOJSON: Optional[Dict[str, Any]] = None
+_CACHED_POLICE_STATIONS: Optional[List[Dict[str, Any]]] = None
+_CACHED_INDIA_GEOJSON: Optional[Dict[str, Any]] = None
+_CACHED_INDIA_TABLE1A: Optional[Dict[str, Any]] = None
+
+
+def load_police_stations_reference() -> List[Dict[str, Any]]:
+    global _CACHED_POLICE_STATIONS
+    if _CACHED_POLICE_STATIONS is None:
+        try:
+            if POLICE_STATIONS_PATH.exists():
+                with open(POLICE_STATIONS_PATH, "r", encoding="utf-8") as f:
+                    _CACHED_POLICE_STATIONS = json.load(f)
+            else:
+                logger.warning("Police stations reference file not found at %s", POLICE_STATIONS_PATH)
+                _CACHED_POLICE_STATIONS = []
+        except Exception as e:
+            logger.error("Error loading police stations reference: %s", e)
+            _CACHED_POLICE_STATIONS = []
+    return _CACHED_POLICE_STATIONS
+
+
+def load_crime_baseline() -> Dict[str, Any]:
+    global _CACHED_BASELINE
+    if _CACHED_BASELINE is None:
+        try:
+            if CRIME_DATA_PATH.exists():
+                with open(CRIME_DATA_PATH, "r", encoding="utf-8") as f:
+                    _CACHED_BASELINE = json.load(f)
+            else:
+                logger.error("Crime baseline file not found at %s", CRIME_DATA_PATH)
+                _CACHED_BASELINE = {"metadata": {}, "districts": {}}
+        except Exception as e:
+            logger.error("Error loading crime baseline: %s", e)
+            _CACHED_BASELINE = {"metadata": {}, "districts": {}}
+    return _CACHED_BASELINE
+
+
+def load_districts_geojson() -> Dict[str, Any]:
+    global _CACHED_GEOJSON
+    if _CACHED_GEOJSON is None:
+        try:
+            if DISTRICTS_GEOJSON_PATH.exists():
+                with open(DISTRICTS_GEOJSON_PATH, "r", encoding="utf-8") as f:
+                    _CACHED_GEOJSON = json.load(f)
+            else:
+                logger.error("Districts GeoJSON not found at %s", DISTRICTS_GEOJSON_PATH)
+                _CACHED_GEOJSON = {"features": []}
+        except Exception as e:
+            logger.error("Error loading districts GeoJSON: %s", e)
+            _CACHED_GEOJSON = {"features": []}
+    return _CACHED_GEOJSON
+
+
+def load_india_states_geojson() -> Dict[str, Any]:
+    global _CACHED_INDIA_GEOJSON
+    if _CACHED_INDIA_GEOJSON is None:
+        try:
+            if INDIA_STATES_GEOJSON_PATH.exists():
+                with open(INDIA_STATES_GEOJSON_PATH, "r", encoding="utf-8") as f:
+                    _CACHED_INDIA_GEOJSON = json.load(f)
+            else:
+                logger.error("India states GeoJSON not found at %s", INDIA_STATES_GEOJSON_PATH)
+                _CACHED_INDIA_GEOJSON = {"type": "FeatureCollection", "features": []}
+        except Exception as e:
+            logger.error("Error loading India states GeoJSON: %s", e)
+            _CACHED_INDIA_GEOJSON = {"type": "FeatureCollection", "features": []}
+    return _CACHED_INDIA_GEOJSON
+
+
+def load_india_states_table1a() -> Dict[str, Any]:
+    global _CACHED_INDIA_TABLE1A
+    if _CACHED_INDIA_TABLE1A is None:
+        try:
+            if INDIA_STATES_TABLE1A_PATH.exists():
+                with open(INDIA_STATES_TABLE1A_PATH, "r", encoding="utf-8") as f:
+                    _CACHED_INDIA_TABLE1A = json.load(f)
+            else:
+                logger.error("India states Table 1A.1 not found at %s", INDIA_STATES_TABLE1A_PATH)
+                _CACHED_INDIA_TABLE1A = {"metadata": {}, "states": {}}
+        except Exception as e:
+            logger.error("Error loading India states Table 1A.1: %s", e)
+            _CACHED_INDIA_TABLE1A = {"metadata": {}, "states": {}}
+    return _CACHED_INDIA_TABLE1A
+
+
+def get_national_safety_overview() -> NationalSafetyOverviewResponse:
+    """
+    Retrieve nationwide statutory safety indicators and green/amber/red thematic boundaries
+    derived strictly from official NCRB Table 1A.1 (2022).
+    """
+    geojson = load_india_states_geojson()
+    table1a = load_india_states_table1a()
+    meta = table1a.get("metadata", {})
+
+    features = geojson.get("features", [])
+    total_states = len(features)
+    states_with_data = sum(1 for f in features if f.get("properties", {}).get("risk_tier") in ("lower", "moderate", "higher"))
+    states_with_subdistrict = sum(1 for f in features if f.get("properties", {}).get("has_district_data") is True)
+
+    return NationalSafetyOverviewResponse(
+        status="active",
+        reporting_year=meta.get("reporting_year", 2022),
+        source_agency=meta.get("source", "National Crime Records Bureau (NCRB), Ministry of Home Affairs, Government of India"),
+        source_title=f"{meta.get('publication', 'Crime in India 2022')} · {meta.get('table', 'Table 1A.1')}",
+        source_url="https://ncrb.gov.in/crime-in-india.html",
+        national_benchmark_rate=meta.get("national_benchmark_rate", 258.1),
+        total_all_india_ipc_cases=meta.get("total_all_india_ipc_cases", 3561379),
+        classification_method="relative_comparison_against_national_benchmark",
+        thresholds=meta.get("thresholds", {
+            "lower_max": 200.0,
+            "moderate_max": 350.0,
+            "higher_min": 350.0,
+        }),
+        color_palette=meta.get("color_palette", {
+            "lower": "#10B981",
+            "moderate": "#F59E0B",
+            "higher": "#EF4444",
+            "no_data": "#94A3B8",
+        }),
+        coverage_summary={
+            "total_states_mapped": total_states,
+            "states_with_statutory_data": states_with_data,
+            "states_with_subdistrict_polygons": states_with_subdistrict,
+            "coverage_percentage": round((states_with_data / total_states * 100.0), 1) if total_states > 0 else 0.0,
+        },
+        geojson=geojson,
+    )
+
+
+
+def point_in_polygon(lon: float, lat: float, poly_coords: List[List[float]]) -> bool:
+    """
+    Standard ray-casting point-in-polygon test.
+    poly_coords is a list of [lon, lat] pairs.
+    """
+    n = len(poly_coords)
+    if n < 3:
+        return False
+    inside = False
+    p1x, p1y = poly_coords[0]
+    for i in range(1, n + 1):
+        p2x, p2y = poly_coords[i % n]
+        if lat > min(p1y, p2y):
+            if lat <= max(p1y, p2y):
+                if lon <= max(p1x, p2x):
+                    xinters = (lat - p1y) * (p2x - p1x) / (p2y - p1y) + p1x if p1y != p2y else p1x
+                    if p1x == p2x or lon <= xinters:
+                        inside = not inside
+        p1x, p1y = p2x, p2y
+    return inside
+
+
+def resolve_police_district(latitude: float, longitude: float) -> Optional[Tuple[str, List[List[float]]]]:
+    """
+    Match latitude and longitude against Delhi Police district polygons.
+    Returns (district_code, polygon_coordinates) or None.
+    Only returns a match when point strictly intersects a reference polygon.
+    Never assigns an arbitrary jurisdiction via centroid fallback.
+    """
+    geojson = load_districts_geojson()
+    features = geojson.get("features", [])
+
+    for feat in features:
+        geom = feat.get("geometry", {})
+        props = feat.get("properties", {})
+        dcode = props.get("district_code")
+        coords = geom.get("coordinates", [])
+
+        if geom.get("type") == "Polygon" and coords:
+            ring = coords[0]
+            if point_in_polygon(longitude, latitude, ring):
+                return dcode, ring
+
+    return None
+
+
+def get_official_state_crime_stat() -> OfficialStateCrimeStat:
+    """Return verified official NCT of Delhi multi-year crime statistics from NCRB Table 1A.1."""
+    baseline = load_crime_baseline()
+    meta = baseline.get("metadata", {})
+    state_ut_totals = meta.get("official_state_ut_totals", {})
+
+    return OfficialStateCrimeStat(
+        state_ut_name="NCT of Delhi",
+        reporting_year=2022,
+        total_ipc_cases=298988,
+        crime_rate_per_lakh=1422.6,
+        data_status="verified_official",
+        is_derived_estimate=False,
+        geographic_resolution="state_ut",
+        source_agency="National Crime Records Bureau (NCRB), Ministry of Home Affairs",
+        source_title="Crime in India 2022",
+        source_url="https://ncrb.gov.in/crime-in-india.html",
+        source_table_or_page="Table 1A.1: Cognizable IPC Crimes in States and Union Territories",
+        population_denominator=21023000,
+        population_denominator_year=2022,
+        population_source="Report of the Technical Group on Population Projections (RGI / Census of India)",
+        multi_year_totals=state_ut_totals,
+        limitations="NCT-wide statutory aggregate. Does not represent local neighborhood-level incident density. Over 74% of offenses represent property and vehicle thefts registered via online e-FIRs.",
+    )
+
+
+async def get_locality_safety_data(
+    latitude: float,
+    longitude: float,
+    address: Optional[str] = None,
+    radius: int = 1200,
+) -> LocalitySafetyResponse:
+    """
+    Produce truthful, evidence-backed safety and historical crime intelligence for given coordinates.
+    Strictly separates verified official State/UT statistics (NCRB Table 1A.1) from exploratory
+    derived district allocations. Never claims an approximate polygon is an official cadastral boundary.
+    """
+    # 1. Coordinate bounds validation
+    if not (-90.0 <= latitude <= 90.0 and -180.0 <= longitude <= 180.0) or math.isnan(latitude) or math.isnan(longitude):
+        return LocalitySafetyResponse(
+            status="data_unavailable",
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
+            search_radius_meters=radius,
+            error_message="Invalid latitude or longitude coordinates.",
+        )
+
+    # 2. Build verified official State/UT benchmark (NCRB Table 1A.1)
+    baseline = load_crime_baseline()
+    meta = baseline.get("metadata", {})
+    state_ut_totals = meta.get("official_state_ut_totals", {})
+    official_state_crime = get_official_state_crime_stat()
+
+    # 3. Check regional coverage for NCT of Delhi (28.20° - 29.05° N, 76.75° - 77.50° E)
+    is_in_delhi_bbox = (28.20 <= latitude <= 29.05 and 76.75 <= longitude <= 77.50)
+    if not is_in_delhi_bbox:
+        return LocalitySafetyResponse(
+            status="unknown_jurisdiction",
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
+            search_radius_meters=radius,
+            official_state_crime=None,
+            matched_district=None,
+            jurisdiction_match_type="none",
+            error_message="Coordinates fall outside the National Capital Territory of Delhi coverage.",
+        )
+
+    # 4. Resolve Police District reference polygon
+    resolved = resolve_police_district(latitude, longitude)
+    if not resolved:
+        return LocalitySafetyResponse(
+            status="unknown_jurisdiction",
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
+            search_radius_meters=radius,
+            official_state_crime=official_state_crime,
+            matched_district=None,
+            jurisdiction_match_type="none",
+            error_message="Location coordinates do not intersect any known police district reference polygon.",
+        )
+
+    district_code, boundary_polygon = resolved
+    districts_data = baseline.get("districts", {})
+    raw_district = districts_data.get(district_code)
+
+    if not raw_district:
+        return LocalitySafetyResponse(
+            status="data_unavailable",
+            latitude=latitude,
+            longitude=longitude,
+            address=address,
+            search_radius_meters=radius,
+            official_state_crime=official_state_crime,
+            matched_district=None,
+            jurisdiction_match_type="none",
+            error_message=f"Official crime records for district {district_code} are not indexed.",
+        )
+
+    # 5. Build DistrictCrimeProfile (strictly marked as derived_estimate)
+    categories = [
+        CrimeCategoryStat(
+            category_id=c["category_id"],
+            label=c["label"],
+            count=c["count"],
+            share_pct=c["share_pct"],
+            description=c["description"],
+        )
+        for c in raw_district.get("categories_2022", [])
+    ]
+
+    provenance_details = {
+        "source_agency": "National Crime Records Bureau (NCRB), Ministry of Home Affairs & Delhi Police",
+        "publication": "Crime in India (2018–2022) Annual Compendiums & Delhi Police Statistical Statements",
+        "official_table_state_ut": "NCRB Crime in India Table 1A.1: Cognizable IPC Crimes in States/UTs",
+        "official_table_cities": "NCRB Crime in India Table 1B.1: Cognizable IPC Crimes in 19 Metropolitan Cities (Delhi City)",
+        "official_portal_url": "https://ncrb.gov.in/crime-in-india.html",
+        "delhi_police_url": "https://delhipolice.gov.in/statistics",
+        "geographic_resolution": "NCT of Delhi State/UT Total with Police District Administrative Allocation",
+        "is_derived_estimate": True,
+        "population_methodology": "Census of India 2011 was surveyed for Revenue Districts, not operational Police Districts. Police district populations are derived projections used by Delhi Police; per-capita rates are suppressed.",
+        "boundary_type": "spatial_approximation_reference",
+        "boundary_disclaimer": "Approximated Police District Jurisdictional Zone. Macro reference geometry for locality mapping; not an official cadastral boundary published by Delhi Police or Survey of India.",
+        "e_fir_theft_context": "Over 74% of registered IPC crimes in Delhi constitute property and vehicle theft, filed digitally via citizen e-FIR portals. Higher counts reflect digital reporting adoption rather than heightened physical danger.",
+    }
+
+    district_profile = DistrictCrimeProfile(
+        district_code=raw_district["district_code"],
+        district_name=raw_district["district_name"],
+        headquarters=raw_district.get("headquarters"),
+        reporting_year=2022,
+        source_agency="Delhi Police & National Crime Records Bureau (NCRB)",
+        source_title="Crime in India 2022 & Delhi Police Annual Review",
+        source_url="https://ncrb.gov.in/crime-in-india.html",
+        source_table_or_page="Derived operational allocation from NCRB Table 1A.1 and Delhi Police Compendiums",
+        publication_date="2023-12-03",
+        geographic_resolution="police_district_estimate",
+        data_status="derived_estimate",
+        is_derived_estimate=True,
+        derivation_method="Administrative operational allocation from aggregate Delhi totals. Not a direct census-tract enumeration.",
+        rate_unavailable_reason="Official Census population denominators do not align with operational police district boundaries; per-capita rate calculation is suppressed to avoid distortions from daytime commuter populations.",
+        limitations="District figures are operational research allocations. Police boundaries are unverified spatial approximations; not published as cadastral GIS layers by Delhi Police or Survey of India. Per-capita crime rates and rankings are strictly suppressed.",
+        population_denominator_year=None,
+        population_projection_2022=raw_district.get("population_projection_2022"),
+        total_ipc_crimes_2022=raw_district["total_ipc_crimes_2022"],
+        crime_rate_per_lakh=None,  # Suppressed: incompatible denominators
+        clearance_rate_pct=raw_district.get("clearance_rate_pct"),
+        historical_trend_ipc=raw_district.get("historical_trend_ipc", {}),
+        categories_2022=categories,
+        jurisdiction_polygon=boundary_polygon,
+        boundary_type="spatial_approximation_reference",
+        boundary_disclaimer="Approximated Police District Jurisdictional Zone. Macro reference geometry for locality mapping; not an official cadastral boundary published by Delhi Police or Survey of India.",
+        state_ut_benchmark=state_ut_totals,
+        provenance_details=provenance_details,
+    )
+
+    # 6. Resolve verified emergency / police facilities (OpenStreetMap + Official Reference Catalog)
+    nearby_stations: List[PoliceStationFacility] = []
+    nearest_stations: List[PoliceStationFacility] = []
+    station_candidates: List[Dict[str, Any]] = []
+
+    # 6a. Seed with verified Delhi Police directory facilities
+    ref_stations = load_police_stations_reference()
+    for ref in ref_stations:
+        rlat = float(ref["latitude"])
+        rlon = float(ref["longitude"])
+        d_km = calculate_haversine_distance_km(latitude, longitude, rlat, rlon)
+        if d_km is not None:
+            station_candidates.append({
+                "osm_id": ref.get("id"),
+                "name": ref["name"],
+                "latitude": rlat,
+                "longitude": rlon,
+                "locality": ref.get("locality"),
+                "distance_km": d_km,
+                "source": "Delhi Police Official Directory & OpenStreetMap",
+            })
+
+    # 6b. Augment with live OpenStreetMap Overpass telemetry when available
+    try:
+        if radius > 0:
+            query_radius = max(radius, 4000)
+            infra_summary = await fetch_overpass_infrastructure(
+                latitude, longitude, radius=query_radius, connect_timeout=1.5, read_timeout=3.0
+            )
+            if infra_summary and getattr(infra_summary, "facilities", None):
+                for fac in infra_summary.facilities:
+                    if getattr(fac, "category", "") == "police":
+                        flat = float(fac.latitude)
+                        flon = float(fac.longitude)
+                        dist_km = calculate_haversine_distance_km(latitude, longitude, flat, flon)
+                        if dist_km is not None:
+                            # Avoid duplicate if station within 250m already present
+                            is_dup = any(
+                                calculate_haversine_distance_km(flat, flon, c["latitude"], c["longitude"]) < 0.25
+                                for c in station_candidates
+                            )
+                            if not is_dup:
+                                station_candidates.append({
+                                    "osm_id": str(fac.id),
+                                    "name": fac.name or "Police Station",
+                                    "latitude": flat,
+                                    "longitude": flon,
+                                    "locality": None,
+                                    "distance_km": dist_km,
+                                    "source": "OpenStreetMap Overpass API",
+                                })
+    except Exception as e:
+        logger.warning("Overpass police stations query failed: %s", e)
+
+    # 6c. Sort strictly by straight-line distance
+    station_candidates.sort(key=lambda s: s["distance_km"] if s["distance_km"] is not None else float("inf"))
+
+    radius_km = (radius / 1000.0) if radius > 0 else 0.0
+    for cand in station_candidates:
+        d_km = cand["distance_km"]
+        is_in_radius = (radius > 0) and (d_km <= radius_km + 0.005)
+        dist_str = f"{d_km:.1f} km"
+        facility = PoliceStationFacility(
+            osm_id=cand.get("osm_id"),
+            name=cand["name"],
+            category="police",
+            category_label="Police Station",
+            latitude=cand["latitude"],
+            longitude=cand["longitude"],
+            distance_km=d_km,
+            formatted_distance=dist_str,
+            source=cand.get("source", "OpenStreetMap / Delhi Police Directory"),
+            locality=cand.get("locality"),
+            is_within_radius=is_in_radius,
+        )
+        if is_in_radius:
+            nearby_stations.append(facility)
+
+    # Extract top 4 nearest verified stations
+    nearest_candidates = station_candidates[:4]
+    for cand in nearest_candidates:
+        d_km = cand["distance_km"]
+        is_in_radius = (radius > 0) and (d_km <= radius_km + 0.005)
+        dist_str = f"{d_km:.1f} km"
+        nearest_stations.append(
+            PoliceStationFacility(
+                osm_id=cand.get("osm_id"),
+                name=cand["name"],
+                category="police",
+                category_label="Police Station",
+                latitude=cand["latitude"],
+                longitude=cand["longitude"],
+                distance_km=d_km,
+                formatted_distance=dist_str,
+                source=cand.get("source", "OpenStreetMap / Delhi Police Directory"),
+                locality=cand.get("locality"),
+                is_within_radius=is_in_radius,
+            )
+        )
+
+    return LocalitySafetyResponse(
+        status="active",
+        latitude=latitude,
+        longitude=longitude,
+        address=address,
+        search_radius_meters=radius,
+        official_state_crime=official_state_crime,
+        matched_district=district_profile,
+        jurisdiction_match_type="approximate_spatial_reference",
+        jurisdiction_disclaimer="Approximate macro reference territory. Official cadastral police district boundaries are not open data; property jurisdiction is indicative.",
+        nearby_police_stations=nearby_stations,
+        nearest_police_stations=nearest_stations,
+        total_police_stations_in_radius=len(nearby_stations),
+    )
